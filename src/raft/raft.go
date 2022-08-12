@@ -423,7 +423,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	rf.applierCond.L.Lock()
 	if len(args.Entries)>0 {
 		for i,ent:= range args.Entries {
 			sliceIdx := rf.log2Slice(args.PrevLogIndex+1+i)
@@ -442,7 +441,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.commitIndex = min(args.LeaderCommit,args.PrevLogIndex+len(args.Entries))
 	rf.applierCond.Broadcast()
-	rf.applierCond.L.Unlock()
 	reply.Success = true
 }
 
@@ -528,11 +526,9 @@ func (rf *Raft) blockingSendAppendEntries() {
 	// }
 	// DPrintf("[ID %d] successCnt = %d",rf.me,sucessCnt)
 	if sucessCnt>len(rf.peers)/2 && rf.commitIndex != rf.slice2Log(len(rf.logs)-1) {
-		rf.applierCond.L.Lock()
 		DPrintf("[ID %d] Commit Log(%d)",rf.me,rf.slice2Log(len(rf.logs)-1))
 		rf.commitIndex = rf.slice2Log(len(rf.logs)-1)
 		rf.applierCond.Broadcast()
-		rf.applierCond.L.Unlock()
 	}
 }
 
@@ -559,12 +555,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1,-1,isLeader
 	}
 	//DPrintf("[ID %d] log append %v",rf.me,command)
-	rf.applierCond.L.Lock()
 	rf.logs = append(rf.logs, LogEntry{
 		Term: rf.currentTerm,
 		Command: command,
 	})
-	rf.applierCond.L.Unlock()
 	DPrintf("[ID %d - Leader] Append Logs to be %v at term %d",rf.me,rf.logs,rf.currentTerm)
 	index := rf.slice2Log(len(rf.logs)-1)
 	term := rf.currentTerm
@@ -615,7 +609,7 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) applier(){
 	for !rf.killed() {
-		rf.applierCond.L.Lock()
+		rf.mu.Lock()
 		for rf.lastApplied==rf.commitIndex {rf.applierCond.Wait()}
 		{
 		// safe applier section here
@@ -630,7 +624,7 @@ func (rf *Raft) applier(){
 				rf.lastApplied = i
 			}
 		}
-		rf.applierCond.L.Unlock()
+		rf.mu.Unlock()
 	}
 }
 
@@ -669,7 +663,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.commitIndex = 0
 	rf.firstIdx = 1
-	rf.applierCond = sync.NewCond(&sync.Mutex{})
+	rf.applierCond = sync.NewCond(&rf.mu)
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
