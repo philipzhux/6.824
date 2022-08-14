@@ -64,6 +64,7 @@ type Raft struct {
 	mu                sync.Mutex // Lock to protect shared access to this peer's state
 	appendEntriesCond *sync.Cond
 	applierCond       *sync.Cond
+	commitCond		  *sync.Cond
 	peers             []*labrpc.ClientEnd // RPC end points of all peers
 	persister         *Persister          // Object to hold this peer's persisted state
 	me                int                 // this peer's index into peers[]
@@ -121,10 +122,10 @@ func (rf *Raft) GetState() (int, bool) {
 // }
 
 func (rf *Raft) getLogTermSafe(idx int) int {
-	if rf.log2Slice(idx) >= 0 {
+	if rf.log2Slice(idx) >= 0 && len(rf.logs) >0 {
 		return rf.logs[rf.log2Slice(idx)].Term
 	} else {
-		return 0
+		return 1
 	}
 }
 
@@ -353,10 +354,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAE(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (rf *Raft) sendAE(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
+
 
 //
 // Append Entries RPC arguments data structrue
@@ -375,13 +377,15 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	// Your data here (2A).
 	Term    int  // inform leader of my current term
+	LogTerm int // term of match or unmatched log
 	Success bool // successfully appended the entry
+	StartIndex int // StartIndex of Current Term
+	LogLength int
 }
 
 type AER struct {
-	Term    int
-	Success bool
 	Id      int
+	AppendEntriesReply
 }
 
 // In case index does not match slice index (with snapshot)
@@ -394,7 +398,7 @@ func (rf *Raft) slice2Log(idx int) int {
 }
 
 // Append Entries RPC handler
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// DPrintf("[ID %d] AppendEntires:replyArgs %d.",rf.me,reply.Me)
@@ -414,8 +418,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// DPrintf("[ID %d] Received AE from leader of term %d",rf.me,args.Term)
 	rf.recvHB = true
 	/* Consistency check */
-	if args.PrevLogIndex >= rf.slice2Log(len(rf.logs)) ||
-		rf.getLogTermSafe(args.PrevLogIndex) != args.PrevLogTerm {
+	if args.PrevLogIndex>0 && (args.PrevLogIndex >= rf.slice2Log(len(rf.logs)) ||
+		rf.getLogTermSafe(args.PrevLogIndex) != args.PrevLogTerm) {
+		DPrintf("[ID %d] logs: %v",rf.me,rf.logs)
+		reply.LogLength = len(rf.logs)
+		reply.LogTerm = max(rf.getLogTermSafe(min(args.PrevLogIndex,rf.slice2Log(len(rf.logs)-1))),1)
+		reply.StartIndex = max(min(args.PrevLogIndex,rf.slice2Log(len(rf.logs)-1)),1)
+		for {
+			if reply.StartIndex-1<1 || rf.getLogTermSafe(reply.StartIndex-1)!=reply.LogTerm {
+				break
+			}
+			reply.StartIndex--
+		}
+
+		DPrintf("[ID %d] return False to AE because of inconsistency: args.PrevLogTerm = %d, args.PrevLogIndex = %d, ",rf.me,args.PrevLogTerm,args.PrevLogIndex)
+		DPrintf("[ID %d] return False to AE because of inconsistency: reply.StartIndex = %d, reply.LogTerm = %d",rf.me,reply.StartIndex,reply.LogTerm)
+
 		reply.Success = false
 		return
 	}
@@ -451,81 +469,118 @@ func (rf *Raft) blockingSendAppendEntries() {
 	replyCnt := 0
 	sucessCnt := 0
 	receiveCnt := 0
+	// payload := make([][]LogEntry, len(rf.peers))
+	// prevLogIndexes := make([]int,len(rf.peers))
+	// prevLogTerms :=  make([]int,len(rf.peers))
 	for id := 0; id < len(rf.peers); id++ {
 		if id == rf.me {
 			continue
 		}
-		go func(peerId int) {
-			replyArgs := &AppendEntriesReply{
-				Term:    -1,
-				Success: false,
-			}
-			payload := make([]LogEntry, 0)
-			if rf.log2Slice(rf.leaderStates.nextIndex[peerId]) < len(rf.logs) {
-				payload = rf.logs[rf.log2Slice(rf.leaderStates.nextIndex[peerId]):]
-			}
-			sendArgs := &AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				PrevLogIndex: rf.leaderStates.nextIndex[peerId] - 1,
-				PrevLogTerm:  rf.getLogTermSafe(rf.leaderStates.nextIndex[peerId] - 1),
-				Entries:      payload,
-				LeaderCommit: rf.commitIndex,
-			}
+		// Mind the TOCCTUU of len(rf.logs) and rf.leaderStates.nextIndex!
+		logsCopy := make([]LogEntry, len(rf.logs[rf.log2Slice(rf.leaderStates.nextIndex[id]):]))
+		copy(logsCopy, rf.logs[rf.log2Slice(rf.leaderStates.nextIndex[id]):])
+		sendArgs := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			PrevLogIndex: rf.leaderStates.nextIndex[id] - 1,
+			PrevLogTerm:  rf.getLogTermSafe(rf.leaderStates.nextIndex[id] - 1),
+			Entries:     logsCopy,
+			LeaderCommit: rf.commitIndex,
+		}
+		// Go routine to sendout AE
+		go func(peerId int, sendArgs AppendEntriesArgs) {
+			var replyArgs AppendEntriesReply
 			// DPrintf("[ID %d] I am sending out LeaderCommit of  %d",rf.me,sendArgs.LeaderCommit)
 			//DPrintf("[ID %d] As a leader, I am sending out AE to %d",rf.me,peerId)
-			ok := rf.sendAE(peerId, sendArgs, replyArgs)
+			ok := rf.sendAE(peerId, sendArgs, &replyArgs)
 			if ok {
 				replyChan <- AER{
-					Term:    replyArgs.Term,
-					Success: replyArgs.Success,
+					AppendEntriesReply: replyArgs,
 					Id:      peerId,
 				}
-
 				//DPrintf("[ID %d] [peerID %d] replyArgs %v.",rf.me,peerId,replyArgs)
 			} else {
 				replyChan <- AER{
-					Term:    -1,
-					Success: false,
-					Id:      -1,
+					AppendEntriesReply: AppendEntriesReply{
+						Term:    -1,
+						Success: false,
+						StartIndex: -1,
+					},
+					Id: -1,
 				}
 			}
-		}(id)
+		}(id, sendArgs)
 	}
+	// Go routine to update commit index, still minding that TOCTTOU problem
+	// using logLen instead of len(logs) is the key
+	go func(logLen int) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		DPrintf("Before wait,%d",time.Now().UnixMilli()%100000)
+		rf.commitCond.Wait()
+		DPrintf("After wait,%d",time.Now().UnixMilli()%100000)
+		if sucessCnt > len(rf.peers)/2 && rf.commitIndex != rf.slice2Log(logLen-1) {
+			DPrintf("[ID %d] Commit Log(%d)", rf.me, rf.slice2Log(logLen-1))
+			rf.commitIndex = rf.slice2Log(logLen-1)
+			rf.applierCond.Broadcast()
+		}
+	}(len(rf.logs))
 	sucessCnt++ // count myself towards sucess
-	for replyCnt < len(rf.peers)-1 && sucessCnt <= len(rf.peers)/2 {
-		replyArgs := <-replyChan
-		replyCnt++
-		if replyArgs.Id == -1 {
-			continue
-		}
-		receiveCnt++
-		if replyArgs.Term > rf.currentTerm {
-			rf.state = Follower
-			rf.voted = false
-			rf.recvHB = true
-			continue
-		}
-		if replyArgs.Success {
-			sucessCnt++
-			if rf.leaderStates.nextIndex[replyArgs.Id] != rf.slice2Log(len(rf.logs)) {
-				DPrintf("[ID %d] Update next index for %d, sucessCnt = %d", rf.me, replyArgs.Id, sucessCnt)
-				rf.leaderStates.matchIndex[replyArgs.Id] = rf.slice2Log(len(rf.logs) - 1)
-				rf.leaderStates.nextIndex[replyArgs.Id] = rf.slice2Log(len(rf.logs))
+	if sucessCnt>len(rf.peers)/2 {rf.commitCond.Signal()}
+	go func(peerCnt int, logLen int) {
+		for replyCnt < peerCnt-1 {
+			replyArgs := <-replyChan
+			rf.mu.Lock()
+			replyCnt++
+			if replyArgs.Id == -1 {
+				rf.mu.Unlock()
+				continue
 			}
-		} else {
-			rf.leaderStates.nextIndex[replyArgs.Id] = max(rf.leaderStates.nextIndex[replyArgs.Id]-1, 1)
+			receiveCnt++
+			if replyArgs.Term > rf.currentTerm {
+				rf.state = Follower
+				rf.voted = false
+				rf.recvHB = true
+				rf.mu.Unlock()
+				break
+			}
+			KPrintf("[ID %d] replyArgs.Id = %d, Success = %v", rf.me, replyArgs.Id,replyArgs.Success)
+			if replyArgs.Success {
+				sucessCnt++
+				
+				if rf.leaderStates.nextIndex[replyArgs.Id] != rf.slice2Log(logLen) {
+					KPrintf("[ID %d] Update next index for %d, sucessCnt = %d", rf.me, replyArgs.Id, sucessCnt)
+					rf.leaderStates.matchIndex[replyArgs.Id] = rf.slice2Log(logLen - 1)
+					rf.leaderStates.nextIndex[replyArgs.Id] = rf.slice2Log(logLen)
+				}
+				if sucessCnt>peerCnt/2 {
+					rf.commitCond.Signal()
+				}
+			} else {
+				if replyArgs.LogLength==-1 {
+					rf.mu.Unlock()
+					break
+				}
+				if replyArgs.LogTerm < rf.currentTerm {
+					rf.leaderStates.nextIndex[replyArgs.Id] = replyArgs.StartIndex
+				} else {
+					rf.leaderStates.nextIndex[replyArgs.Id] = rf.slice2Log(replyArgs.LogLength)
+				}
+				// rf.leaderStates.nextIndex[replyArgs.Id] = max(rf.leaderStates.nextIndex[replyArgs.Id]-1, 1)
+			}
+			rf.mu.Unlock()
 		}
-	}
-	// if receiveCnt+1<len(rf.peers)/2 {
-	// 	rf.state = Follower
-	// }
-	// DPrintf("[ID %d] successCnt = %d",rf.me,sucessCnt)
-	if sucessCnt > len(rf.peers)/2 && rf.commitIndex != rf.slice2Log(len(rf.logs)-1) {
-		DPrintf("[ID %d] Commit Log(%d)", rf.me, rf.slice2Log(len(rf.logs)-1))
-		rf.commitIndex = rf.slice2Log(len(rf.logs) - 1)
-		rf.applierCond.Broadcast()
-	}
+		// if receiveCnt+1<len(rf.peers)/2 {
+		// 	rf.state = Follower
+		// }
+		// DPrintf("[ID %d] successCnt = %d",rf.me,sucessCnt)
+	}(len(rf.peers),len(rf.logs))
+	
 }
+
+
+
+
+
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -553,7 +608,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Command: command,
 	})
-	DPrintf("[ID %d - Leader] Append Logs to be %v at term %d", rf.me, rf.logs, rf.currentTerm)
+	// DPrintf("[ID %d - Leader] Append Logs to be %v at term %d", rf.me, rf.logs, rf.currentTerm)
 	index := rf.slice2Log(len(rf.logs) - 1)
 	term := rf.currentTerm
 
@@ -588,7 +643,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	rand.Seed(time.Now().UnixNano() + int64(rf.me))
 	for !rf.killed() {
-		time.Sleep(time.Millisecond * time.Duration(100*(rand.Intn(4)+4)))
+		time.Sleep(time.Millisecond * time.Duration(100*(rand.Intn(3)+3)))
 		rf.mu.Lock()
 		needElect := !rf.recvHB && rf.state != Leader
 		rf.recvHB = false
@@ -657,6 +712,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.firstIdx = 1
 	rf.applierCond = sync.NewCond(&rf.mu)
+	rf.commitCond = sync.NewCond(&rf.mu)
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
